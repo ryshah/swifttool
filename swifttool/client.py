@@ -184,6 +184,11 @@ def _fab_copy_swift_directory(local_files, remote_dir):
     put(local_files, remote_dir, mirror_local_mode=True)
 
 
+@parallel
+def _fab_start_swift_services():
+    with hide('running', 'stdout', 'stderr'):
+        sudo("swift-init start all", pty=False, shell=False)
+
 def bootstrap(args):
     rc = 0
     if not os.path.exists(args.config):
@@ -200,6 +205,7 @@ def bootstrap(args):
         tempfiles = os.path.join(tempdir, "*")
         execute(_fab_copy_swift_directory, tempfiles, args.outdir,
                 hosts=ringsdef.nodes)
+        execute(_fab_start_swift_services, hosts=ringsdef.nodes)
     except Exception as e:
         print >> sys.stderr, "There was an error bootrapping: '%s'" % e
         rc = -1

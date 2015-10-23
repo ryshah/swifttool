@@ -144,15 +144,24 @@ class SwiftRingsDefinition(object):
                     elif isinstance(disks['disks'], list):
                         ringdisks = disks['disks']
                     
-                    for disk in ringdisks:
-                        match = re.match('(.*)\d+$', disk)
-                        blockdev = '/dev/%s' % match.group(1)
-
-                        # treat size as weight and serial as metadata
-                        weight, serial = get_disk_size_serial(node, blockdev)
-
+                    for ringdisk in ringdisks:
+                        disk = None
+                        weight = None
+                        serial = None
                         metadata = meta
-                        if not meta:
+                        if not isinstance(ringdisk, dict):
+                            match = re.match('(.*)\d+$', ringdisk)
+                            blockdev = '/dev/%s' % match.group(1)
+
+                            # treat size as weight and serial as metadata
+                            weight, serial = get_disk_size_serial(node, blockdev)
+                            disk = ringdisk
+                        else:
+                            disk = ringdisk['blockdev']
+                            weight = ringdisk['weight']
+                            metadata = ringdisk.get('metadata', 'nometadata')
+
+                        if not metadata and serial:
                             metadata = serial
                         cmd = self._ring_add_command(ringtype, outdir, zone,
                                                      node,

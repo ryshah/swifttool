@@ -19,13 +19,14 @@
 #
 
 import argparse
+import glob
 import json
 import netifaces
 import os
-import subprocess
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import yaml
@@ -96,26 +97,48 @@ class SwiftRingsDefinition(object):
         self.replicas = 3
         self.min_part_hours = 1
         self.zones = {}
+        # Area to build new or update existing rings
+        self.workspace = tempfile.mkdtemp()
         if data:
             self.__dict__.update(data)
+
+    def __del__(self):
+        shutil.rmtree(self.workspace)
 
     def __repr__(self):
         return str(self.__dict__)
 
-    def _ring_create_command(self, ringtype, outdir):
+    def _ring_create_command(self, ringtype):
         return "%s %s/%s.builder create %d %d %d" % (
-            self.ring_builder_cmd, outdir, ringtype, int(self.part_power),
-            int(self.replicas), int(self.min_part_hours))
+            self.ring_builder_cmd, self.workspace, ringtype,
+            int(self.part_power), int(self.replicas),
+            int(self.min_part_hours))
 
-    def _ring_add_command(self, ringtype, outdir, zone, host, port, disk,
+    def _ring_add_command(self, ringtype, zone, host, port, disk,
                           metadata, weight):
         return "%s %s/%s.builder add %s-%s:%d/%s_%s %d" % (
-            self.ring_builder_cmd, outdir, ringtype, zone, host, int(port),
-            disk, metadata, int(weight))
+            self.ring_builder_cmd, self.workspace, ringtype, zone, host,
+            int(port), disk, metadata, int(weight))
 
-    def _ring_rebalance_command(self, ringtype, outdir):
+    def _ring_rebalance_command(self, ringtype):
         return "%s %s/%s.builder rebalance" % (
-            self.ring_builder_cmd, outdir, ringtype)
+            self.ring_builder_cmd, self.workspace, ringtype)
+
+    def _ring_setweight_command(self, ringtype, zone, host, port,
+                                disk, weight):
+        return "%s %s/%s.builder set_weight %s-%s:%d/%s %d" % (
+            self.ring_builder_cmd, self.workspace, ringtype, zone, host,
+            int(port), disk, int(weight))
+
+    def _ring_remove_command(self, ringtype, zone, host, port, disk):
+        return "%s %s/%s.builder remove %s-%s:%d/%s" % (
+            self.ring_builder_cmd, self.workspace, ringtype, zone, host,
+            int(port), disk)
+
+    def _ring_search_command(self, ringtype, zone, host, port, disk):
+        return "%s %s/%s.builder search %s-%s:%d/%s" % (
+            self.ring_builder_cmd, self.workspace, ringtype, zone, host,
+            int(port), disk)
 
     @property
     def nodes(self):
@@ -125,14 +148,18 @@ class SwiftRingsDefinition(object):
                 ret.update(nodes.keys())
         return ret
 
-    def generate_commands(self, outdir, rebalance=True, meta=None):
+    def generate_commands(self, rebalance=True, meta=None):
         commands = []
 
         for ringtype in RING_TYPES:
-            commands.append(self._ring_create_command(ringtype, outdir))
+            builder_present = os.path.exists("%s/%s.builder" %
+                                             (self.workspace, ringtype))
+            if not builder_present:
+                commands.append(self._ring_create_command(ringtype))
+
             for zone, nodes in self.zones.iteritems():
                 for node, disks in nodes.iteritems():
-                    
+
                     ringdisks = []
                     # Add all disks designated for ringtype
                     if isinstance(disks['disks'], dict):
@@ -143,7 +170,7 @@ class SwiftRingsDefinition(object):
                                             "Unknown ringtype: %s" % ringtype)
                     elif isinstance(disks['disks'], list):
                         ringdisks = disks['disks']
-                    
+
                     for ringdisk in ringdisks:
                         disk = None
                         weight = None
@@ -154,32 +181,66 @@ class SwiftRingsDefinition(object):
                             blockdev = '/dev/%s' % match.group(1)
 
                             # treat size as weight and serial as metadata
-                            weight, serial = get_disk_size_serial(node, blockdev)
+                            weight, serial = get_disk_size_serial(node,
+                                                                  blockdev)
                             disk = ringdisk
                         else:
                             disk = ringdisk['blockdev']
                             weight = ringdisk['weight']
-                            metadata = ringdisk.get('metadata', 'nometadata')
+                            metadata = ringdisk.get('metadata',
+                                                    'nometadata')
 
                         if not metadata and serial:
                             metadata = serial
-                        cmd = self._ring_add_command(ringtype, outdir, zone,
-                                                     node,
-                                                     self.ports[ringtype],
-                                                     disk, metadata, weight)
+                        port = self.ports[ringtype]
+                        # When rings are not present or if device does not
+                        # exist in ring, add it to the ring
+                        # Else if the weight is to be set to 0 remove
+                        # the device eor just update the weight
+                        if not builder_present or \
+                           not self._is_devpresent(ringtype, zone, node,
+                                                   port, disk):
+                            cmd = self._ring_add_command(ringtype, zone,
+                                                         node, port,
+                                                         disk, metadata,
+                                                         weight)
+                        else:
+                            if int(weight) == 0:
+                                cmd = self._ring_remove_command(ringtype,
+                                                                zone, node,
+                                                                port, disk)
+                            else:
+                                # Always set the weight of device
+                                # Verified that setting weight (to same)
+                                # value doesnt cause partitions to reassign
+                                cmd = self._ring_setweight_command(ringtype,
+                                                                   zone,
+                                                                   node,
+                                                                   port,
+                                                                   disk,
+                                                                   weight)
                         commands.append(cmd)
             if rebalance:
-                commands.append(self._ring_rebalance_command(ringtype, outdir))
+                commands.append(self._ring_rebalance_command(ringtype))
 
         return commands
 
-    def generate_script(self, outdir, name='ring_builder.sh', rebalance=True,
-                        meta=None):
+    def _update_workspace(self, outdir):
+        # Copy the builder files if all 3 exists, else create new
+        if os.path.exists(os.path.join(outdir, "account.builder")) and \
+           os.path.exists(os.path.join(outdir, "container.builder")) and \
+           os.path.exists(os.path.join(outdir, "object.builder")):
+            for filename in glob.glob(os.path.join(outdir, "*.builder")):
+                shutil.copy(filename, self.workspace)
+
+    def generate_script(self, outdir, name='ring_builder.sh',
+                        rebalance=True, meta=None):
+        self._update_workspace(outdir)
         commands = ["#!/bin/bash\n"]
-        commands = commands + self.generate_commands(outdir, rebalance,
+        commands = commands + self.generate_commands(rebalance,
                                                      meta)
 
-        outfile = os.path.join(outdir, name)
+        outfile = os.path.join(self.workspace, name)
         f = open(outfile, 'w')
         for command in commands:
             f.write("%s\n" % command)
@@ -188,6 +249,12 @@ class SwiftRingsDefinition(object):
         st = os.stat(outfile)
         os.chmod(outfile, st.st_mode | stat.S_IEXEC)
         return outfile
+
+    def _is_devpresent(self, ringtype, zone, node, port, disk):
+        command = self._ring_search_command(ringtype, zone, node,
+                                            port, disk)
+        rc = subprocess.call(command, shell=True)
+        return rc == 0
 
 
 def ip4_addresses():
@@ -210,6 +277,7 @@ def _fab_start_swift_services():
     with hide('running', 'stdout', 'stderr'):
         sudo("swift-init start all", pty=False, shell=False)
 
+
 def bootstrap(args):
     rc = 0
     if not os.path.exists(args.config):
@@ -219,11 +287,11 @@ def bootstrap(args):
         config = yaml.load(open(args.config, 'r'))
         ringsdef = SwiftRingsDefinition(config)
 
-        tempdir = tempfile.mkdtemp()
-        build_script = ringsdef.generate_script(tempdir, meta=args.meta)
+        build_script = ringsdef.generate_script(outdir=args.outdir,
+                                                meta=args.meta)
         subprocess.call(build_script)
 
-        tempfiles = os.path.join(tempdir, "*")
+        tempfiles = os.path.join(ringsdef.workspace, "*")
         execute(_fab_copy_swift_directory, tempfiles, args.outdir,
                 hosts=ringsdef.nodes)
         execute(_fab_start_swift_services, hosts=ringsdef.nodes)
@@ -231,7 +299,6 @@ def bootstrap(args):
         print >> sys.stderr, "There was an error bootrapping: '%s'" % e
         rc = -1
 
-    shutil.rmtree(tempdir)
     sys.exit(rc)
 
 

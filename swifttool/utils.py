@@ -1,8 +1,26 @@
-from fabric.api import task, env, execute, hide, parallel, put, run, settings, sudo
+import os
 import re
+from fabric.api import task, env, execute, hide, parallel, put, run, settings, sudo
+from swift.common.ring import RingBuilder
+
+def get_ring_devices():
+    builder_types = ['account', 'container', 'object']
+    devices = {}
+    for builder in builder_types:
+        builder_path = os.path.join('/etc/swift',
+                       builder + ".builder")
+        ring_builder = RingBuilder.load(builder_path)
+        devices[builder] = {}
+        for dev in ring_builder.devs:
+            device = {}
+            device['ip'] = dev['ip']
+            device['weight'] = dev['weight']
+            device['device'] = dev['device']
+            device['region'] = dev['region']
+            devices[builder].setdefault(str(dev['zone']),[]).append(device)
+    return devices
 
 _host_lshw_output = {}
-
 
 def _parse_lshw_output(output, blockdev):
     disks = re.split('\s*\*', output.strip())

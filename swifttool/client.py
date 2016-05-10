@@ -31,11 +31,12 @@ import sys
 import tempfile
 import yaml
 
-from diskinfo import get_disk_size_serial
+from utils import parse_ring_disks_info
 from fabric.api import env, execute, hide, parallel, put, sudo
 from netifaces import interfaces, ifaddresses, AF_INET
 
 RING_TYPES = ['account', 'container', 'object']
+
 
 class SwiftRingsDefinition(object):
 
@@ -102,6 +103,7 @@ class SwiftRingsDefinition(object):
 
     def generate_commands(self, rebalance=True, meta=None):
         commands = []
+        ring_disks = parse_ring_disks_info(self.zones, metadata=meta)
 
         for ringtype in RING_TYPES:
             builder_present = os.path.exists("%s/%s.builder" %
@@ -109,69 +111,40 @@ class SwiftRingsDefinition(object):
             if not builder_present:
                 commands.append(self._ring_create_command(ringtype))
 
-            for zone, nodes in self.zones.iteritems():
-                for node, disks in nodes.iteritems():
-
-                    ringdisks = []
-                    # Add all disks designated for ringtype
-                    if isinstance(disks['disks'], dict):
-                        if ringtype in disks['disks']:
-                            ringdisks += disks['disks'][ringtype]
+            for zone, devices in ring_disks[ringtype].iteritems():
+                for device in devices:
+                    port = self.ports[ringtype]
+                    weight = device['weight']
+                    disk = device['device']
+                    node = device['ip']
+                    metadata = device['metadata']
+                    # When rings are not present or if device does not
+                    # exist in ring, add it to the ring
+                    # Else if the weight is to be set to 0 remove
+                    # the device eor just update the weight
+                    if not builder_present or \
+                       not self._is_devpresent(ringtype, zone, node,
+                                               port, disk):
+                        cmd = self._ring_add_command(ringtype, zone,
+                                                     node, port,
+                                                     disk, metadata,
+                                                     weight)
+                    else:
+                        if int(weight) == 0:
+                            cmd = self._ring_remove_command(ringtype,
+                                                            zone, node,
+                                                            port, disk)
                         else:
-                            raise Exception("Malformed ring_defintion.yml. "
-                                            "Unknown ringtype: %s" % ringtype)
-                    elif isinstance(disks['disks'], list):
-                        ringdisks = disks['disks']
-
-                    for ringdisk in ringdisks:
-                        disk = None
-                        weight = None
-                        serial = None
-                        metadata = meta
-                        if not isinstance(ringdisk, dict):
-                            match = re.match('(.*)\d+$', ringdisk)
-                            blockdev = '/dev/%s' % match.group(1)
-
-                            # treat size as weight and serial as metadata
-                            weight, serial = get_disk_size_serial(node,
-                                                                  blockdev)
-                            disk = ringdisk
-                        else:
-                            disk = ringdisk['blockdev']
-                            weight = ringdisk['weight']
-                            metadata = ringdisk.get('metadata',
-                                                    'nometadata')
-
-                        if not metadata and serial:
-                            metadata = serial
-                        port = self.ports[ringtype]
-                        # When rings are not present or if device does not
-                        # exist in ring, add it to the ring
-                        # Else if the weight is to be set to 0 remove
-                        # the device eor just update the weight
-                        if not builder_present or \
-                           not self._is_devpresent(ringtype, zone, node,
-                                                   port, disk):
-                            cmd = self._ring_add_command(ringtype, zone,
-                                                         node, port,
-                                                         disk, metadata,
-                                                         weight)
-                        else:
-                            if int(weight) == 0:
-                                cmd = self._ring_remove_command(ringtype,
-                                                                zone, node,
-                                                                port, disk)
-                            else:
-                                # Always set the weight of device
-                                # Verified that setting weight (to same)
-                                # value doesnt cause partitions to reassign
-                                cmd = self._ring_setweight_command(ringtype,
-                                                                   zone,
-                                                                   node,
-                                                                   port,
-                                                                   disk,
-                                                                   weight)
-                        commands.append(cmd)
+                            # Always set the weight of device
+                            # Verified that setting weight (to same)
+                            # value doesnt cause partitions to reassign
+                            cmd = self._ring_setweight_command(ringtype,
+                                                               zone,
+                                                               node,
+                                                               port,
+                                                               disk,
+                                                               weight)
+                    commands.append(cmd)
             if rebalance:
                 commands.append(self._ring_rebalance_command(ringtype))
 

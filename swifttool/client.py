@@ -19,8 +19,11 @@
 #
 
 import argparse
+import copy
 import glob
 import json
+import logging
+import math
 import netifaces
 import os
 import re
@@ -29,11 +32,192 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import yaml
 
-from utils import get_devices, RING_TYPES
 from fabric.api import env, execute, hide, parallel, put, sudo
 from netifaces import interfaces, ifaddresses, AF_INET
+from logging.handlers import SysLogHandler
+from swift.common.ring import RingBuilder
+
+RING_TYPES = ['account', 'container', 'object']
+_host_lshw_output = {}
+
+
+class CapacityManager(object):
+
+    def __init__(self, iterations=10,
+                 def_file='/etc/swift/ring_definition.yml'):
+        self.iterations = int(iterations)
+        self.def_file = def_file
+        self.cluster_changes = {}
+        self.cluster_config = None
+        self._calculate_cluster_changes()
+        self._setup_rsyslog()
+
+    def update_cluster(self):
+        self.logger.info("Starting to update the cluster")
+        for iteration in range(0, self.iterations):
+            changed = self._update_cluster_nodes()
+            if not changed:
+                break
+            self.logger.info("Iteration " + str(iteration) + " complete")
+            self.logger.info("Sleeping for 60 seconds")
+            time.sleep(60)
+        self.logger.info("Finished updating the cluster")
+        # Force rebalance and wailt until there no more required
+
+    def _update_cluster_nodes(self):
+        try:
+            updated_cfg = copy.deepcopy(self.cluster_config)
+            # Update the cluster config to what
+            # we desirei
+            changed = False
+            for builder in RING_TYPES:
+                if builder not in self.cluster_changes:
+                    continue
+                for builder_changes in self.cluster_changes[builder]:
+                    for zone, devices in builder_changes.items():
+                        # Get the current configuration from rings
+                        ring_devs = _get_ring_devices(builder, zone)
+                        ip = self._get_zone_ip(devices)
+                        updated_cfg['zones'].setdefault(zone, {})
+                        updated_cfg['zones'][zone].setdefault(ip, {})
+                        updated_cfg['zones'][zone][ip].setdefault('disks', {})
+                        newdevs = []
+                        for dev in devices:
+                            devname = dev['device']
+                            if devname not in ring_devs:
+                                initial_weight = 0
+                            else:
+                                initial_weight = ring_devs[devname]
+                            if initial_weight == dev['target']:
+                                continue
+                            devinfo = {}
+                            devinfo['blockdev'] = devname
+                            devinfo['weight'] = int(initial_weight
+                                                    + dev['step'])
+                            if abs(devinfo['weight'] - dev['target']) < 50:
+                                devinfo['weight'] = dev['target']
+                            self.logger.debug("Updating %s builder. \
+                                Setting the %s device capacity to %s",
+                                              builder, devname,
+                                              str(devinfo['weight']))
+                            newdevs.append(devinfo)
+                            changed = True
+                        updated_cfg['zones'][zone][ip]['disks'][builder] = \
+                            newdevs
+            if changed:
+                _ringsdef_helper(updated_cfg, 'nometadata', '/etc/swift')
+            return changed
+        except Exception as e:
+            print "Error updating cluster configuration", e
+            sys.exit(-1)
+
+    @staticmethod
+    def _get_zone_ip(devs):
+        for dev in devs:
+            if 'ip' in dev:
+                return dev['ip']
+
+    def _calculate_cluster_changes(self):
+        try:
+            self.cluster_config = yaml.load(open(self.def_file, 'r'))
+            expected_config = get_devices(self.cluster_config['zones'])
+            current_config = _get_all_cluster_devices()
+            # To get devices to be removed we look for devices present in
+            # current_config and not in expected_config
+            # To get list of devices to be added look for devices in expected
+            # not in current
+            additions = self._get_devices_changed(expected_config,
+                                                  current_config)
+            removals = self._get_devices_changed(current_config,
+                                                 expected_config)
+            # Reconcile the two structures in to single
+            # Each ring will be list of devices to be modified
+            # Each device (in ring) will have following attributes:
+            # - zone
+            # - ip
+            # - device
+            # - target (device weight when adding, 0 when removing)
+            # - step (amount to change every time till target reached)
+            # step is defaulted to 10% or -10% of target
+            self._calculate_changes(additions, True)
+            self._calculate_changes(removals, False)
+        except Exception as e:
+            print "Error getting device info", e
+            sys.exit(-1)
+
+    def _calculate_changes(self, source, add_operation=True):
+        for builder in RING_TYPES:
+            for zone, devadd in source[builder].items():
+                self.cluster_changes.setdefault(builder, [])
+                devices = []
+                for device in devadd:
+                    dev = {}
+                    dev['ip'] = device['ip']
+                    dev['device'] = device['device']
+                    if add_operation:
+                        dev['target'] = device['weight']
+                        dev['step'] = int(math.ceil(device['weight'] /
+                                                    self.iterations))
+                    else:
+                        dev['target'] = 0
+                        dev['step'] = int(-1 * math.ceil(device['weight'] /
+                                                         self.iterations))
+                    devices.append(dev)
+                self.cluster_changes[builder].append({zone: devices})
+
+    @staticmethod
+    def _get_devices_changed(devices1, devices2):
+        devices = {}
+        for builder in RING_TYPES:
+            devices[builder] = {}
+            for zone, devs in devices1[builder].iteritems():
+                if zone not in devices2[builder]:
+                    devices[builder].setdefault(zone, []).extend(devs)
+        return devices
+
+    def _setup_rsyslog(self):
+        self.logger = logging.getLogger('capman')
+        self.logger.setLevel(logging.DEBUG)
+        handler = SysLogHandler(address='/dev/log',
+                                facility=SysLogHandler.LOG_LOCAL0)
+        fmt = logging.Formatter("%(name)s: %(levelname)s [-] %(message)s")
+        handler.setFormatter(fmt)
+        self.logger.addHandler(handler)
+
+
+def _get_ring_devices(ring_type, zone):
+    builder = RingBuilder.load(_get_builder_path(ring_type))
+    search_values = {}
+    search_values['zone'] = int(zone[1:])
+    devs = builder.search_devs(search_values)
+    list = {}
+    for dev in devs:
+        list[dev['device']] = dev['weight']
+    return list
+
+
+def _get_builder_path(ring_type):
+    return os.path.join('/etc/swift', ring_type + '.builder')
+
+
+def _get_all_cluster_devices():
+    devices = {}
+    for builder in RING_TYPES:
+        ring_builder = RingBuilder.load(_get_builder_path(builder))
+        devices[builder] = {}
+        for dev in ring_builder.devs:
+            if dev is None:
+                continue
+            device = {}
+            device['ip'] = dev['ip']
+            device['weight'] = dev['weight']
+            device['device'] = dev['device']
+            devices[builder].setdefault('z' + str(dev['zone']),
+                                        []).append(device)
+    return devices
 
 
 class SwiftRingsDefinition(object):
@@ -201,27 +385,124 @@ def _fab_start_swift_services():
         sudo("swift-init start all", pty=False, shell=False)
 
 
+def get_devices(zones, metadata=None):
+    devices = {}
+    for builder in RING_TYPES:
+        devices[builder] = {}
+        for zone, nodes in zones.iteritems():
+            devices[builder][zone] = []
+            for node, disks in nodes.iteritems():
+                ringdisks = []
+                # Add all disks designated for ringtype
+                if isinstance(disks['disks'], dict):
+                    if builder in disks['disks']:
+                        ringdisks += disks['disks'][builder]
+                elif isinstance(disks['disks'], list):
+                    ringdisks = disks['disks']
+            for ringdisk in ringdisks:
+                device = {}
+                device['weight'] = None
+                device['metadata'] = metadata
+                device['device'] = None
+                device['ip'] = node
+                if not isinstance(ringdisk, dict):
+                    device['device'] = ringdisk
+                    match = re.match('(.*)\d+$', ringdisk)
+                    blockdev = '/dev/%s' % match.group(1)
+                    # treat size as weight and serial as metadata
+                    weight, serial = get_disk_size_serial(node, blockdev)
+                    device['weight'] = weight
+                    if not metadata:
+                        device['metadata'] = serial
+                else:
+                    device['device'] = ringdisk['blockdev']
+                    device['weight'] = ringdisk['weight']
+                devices[builder][zone].append(device)
+    return devices
+
+
+def _parse_lshw_output(output, blockdev):
+    disks = re.split('\s*\*', output.strip())
+    alldisks = []
+    for disk in disks:
+        d = {}
+        for line in disk.split('\n'):
+            match = re.match('^-(\w+)', line)
+            if match:
+                d['class'] = match.group(1)
+            else:
+                match = re.match('^\s+([\w\s]+):\s+(.*)$', line)
+                if match:
+                    key = re.sub('\s', '_', match.group(1))
+                    val = match.group(2)
+                    d[key] = val
+        if 'class' in d:
+            alldisks.append(d)
+
+    for d in alldisks:
+        if d['logical_name'] == blockdev:
+            serial = d['serial']
+            match = re.match('\s*(\d+)[MG]iB.*', d['size'])
+            if not match:
+                raise Exception("Could not find size of disk %s" % disk)
+            size = int(match.group(1))
+            return size, serial
+
+
+def _fab_get_disk_size_serial(ip, blockdev):
+    with hide('running', 'stdout', 'stderr'):
+        global _host_lshw_output
+        output = None
+        if ip in _host_lshw_output:
+            output = _host_lshw_output[ip]
+        else:
+            output = sudo('lshw -C disk', pty=False, shell=False)
+            _host_lshw_output[ip] = output
+        return _parse_lshw_output(output, blockdev)
+
+
+def get_disk_size_serial(ip, blockdev):
+    with hide('running', 'stdout', 'stderr'):
+        out = execute(_fab_get_disk_size_serial, ip, blockdev, hosts=[ip])
+        return out[ip]
+
+
+def _ringsdef_helper(config, metadata, outputdir):
+    ringsdef = SwiftRingsDefinition(config)
+
+    build_script = ringsdef.generate_script(outdir=outputdir,
+                                            meta=metadata)
+    subprocess.call(build_script)
+    tempfiles = os.path.join(ringsdef.workspace, "*")
+    execute(_fab_copy_swift_directory, tempfiles, outputdir,
+            hosts=ringsdef.nodes)
+    return ringsdef.nodes
+
+
+def manage(args):
+    rc = 0
+    if not os.path.exists(args.config):
+        raise Exception("Could not find confguration file '%s'" % args.config)
+    try:
+        capman = CapacityManager(args.iterations, args.config)
+        capman.update_cluster()
+    except Exception as e:
+        print >> sys.stderr, "There was an error updating rings: '%s'" % e
+        rc = -1
+    sys.exit(rc)
+
+
 def bootstrap(args):
     rc = 0
     if not os.path.exists(args.config):
         raise Exception("Could not find confguration file '%s'" % args.config)
-
     try:
         config = yaml.load(open(args.config, 'r'))
-        ringsdef = SwiftRingsDefinition(config)
-
-        build_script = ringsdef.generate_script(outdir=args.outdir,
-                                                meta=args.meta)
-        subprocess.call(build_script)
-
-        tempfiles = os.path.join(ringsdef.workspace, "*")
-        execute(_fab_copy_swift_directory, tempfiles, args.outdir,
-                hosts=ringsdef.nodes)
-        execute(_fab_start_swift_services, hosts=ringsdef.nodes)
+        ringhosts = _ringsdef_helper(config, args.meta, args.outdir)
+        execute(_fab_start_swift_services, hosts=ringhosts)
     except Exception as e:
         print >> sys.stderr, "There was an error bootrapping: '%s'" % e
         rc = -1
-
     sys.exit(rc)
 
 
@@ -231,12 +512,16 @@ def main():
 
     parser.add_argument('-i', dest='keyfile')
     parser.add_argument('-u', dest='user')
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--outdir', required=True)
 
     parser_genconfig = subparsers.add_parser('bootstrap')
-    parser_genconfig.add_argument('--config', required=True)
-    parser_genconfig.add_argument('--outdir', required=True)
     parser_genconfig.add_argument('--meta', default=None)
     parser_genconfig.set_defaults(func=bootstrap)
+
+    parser_manage = subparsers.add_parser('manage')
+    parser_manage.add_argument('--iterations', default=10)
+    parser_manage.set_defaults(func=manage)
 
     args = parser.parse_args()
     if args.keyfile:

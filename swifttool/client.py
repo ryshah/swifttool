@@ -37,35 +37,62 @@ import yaml
 
 from fabric.api import env, execute, hide, parallel, put, sudo
 from netifaces import interfaces, ifaddresses, AF_INET
-from logging.handlers import SysLogHandler
 from swift.common.ring import RingBuilder
 
 RING_TYPES = ['account', 'container', 'object']
 _host_lshw_output = {}
-
+STATUS_FILE = 'capacity.status'
+LOGFILE_NAME = 'capman.log'
 
 class CapacityManager(object):
 
     def __init__(self, iterations=10,
-                 def_file='/etc/swift/ring_definition.yml'):
+                 def_file='/etc/swift/ring_definition.yml',
+                 scaleup=True, metadata=None, 
+                 outdir='/etc/swift/'):
         self.iterations = int(iterations)
         self.def_file = def_file
+        self.scaleup = scaleup
         self.cluster_changes = {}
+        self.outdir = outdir
         self.cluster_config = None
+        self.metadata = metadata
+        # Save the copy
+        shutil.copyfile(self.def_file, self.def_file + ".orig")
+        self.current_status = os.path.join(outdir, STATUS_FILE)
+        self._write_status(0)
         self._calculate_cluster_changes()
-        self._setup_rsyslog()
+        self._setup_logger()
+    
+    def __del__(self):
+        # Cleanup the files we create
+        os.remove(self.current_status)
+        os.remove(self.def_file + ".orig")
 
     def update_cluster(self):
         self.logger.info("Starting to update the cluster")
-        for iteration in range(0, self.iterations):
-            changed = self._update_cluster_nodes()
+        min_part_hours = int(self._get_builder('account').min_part_hours)
+        for iteration in range(1, self.iterations + 1):
+            changed, cfg = self._update_cluster_nodes()
             if not changed:
                 break
+            # Write up the new config in /etc/swift
+            with open(self.def_file, 'w') as stream:
+                yaml.dump(cfg, stream, default_flow_style=False, 
+                          explicit_start=True)
+            #Update status
+            self._write_status(int((100* iteration)/self.iterations))
             self.logger.info("Iteration " + str(iteration) + " complete")
-            self.logger.info("Sleeping for 60 seconds")
-            time.sleep(60)
+            self.logger.info("Sleeping for %d hours 1 minutes" % min_part_hours)
+            time.sleep((min_part_hours * (60* 60)) + 60) # Sleep for min_part_hours + minute
+         
         self.logger.info("Finished updating the cluster")
-        # Force rebalance and wailt until there no more required
+        # Things finished with no errors - copy the original file back
+        shutil.copyfile(self.def_file + ".orig", self.def_file)
+
+    def _write_status(self, percent_done):
+        with open(self.current_status,'w') as status:
+            status.write(str(percent_done))
 
     def _update_cluster_nodes(self):
         try:
@@ -76,10 +103,11 @@ class CapacityManager(object):
             for builder in RING_TYPES:
                 if builder not in self.cluster_changes:
                     continue
+                self.logger.debug("Updating %s builder.", builder)
                 for builder_changes in self.cluster_changes[builder]:
                     for zone, devices in builder_changes.items():
                         # Get the current configuration from rings
-                        ring_devs = _get_ring_devices(builder, zone)
+                        ring_devs = self._get_ring_devices(builder, zone)
                         ip = self._get_zone_ip(devices)
                         updated_cfg['zones'].setdefault(zone, {})
                         updated_cfg['zones'][zone].setdefault(ip, {})
@@ -99,17 +127,16 @@ class CapacityManager(object):
                                                     + dev['step'])
                             if abs(devinfo['weight'] - dev['target']) < 50:
                                 devinfo['weight'] = dev['target']
-                            self.logger.debug("Updating %s builder. \
-                                Setting the %s device capacity to %s",
-                                              builder, devname,
-                                              str(devinfo['weight']))
+                            self.logger.debug("Setting the %s device \
+                                               capacity to %s",
+                                              devname, str(devinfo['weight']))
                             newdevs.append(devinfo)
                             changed = True
                         updated_cfg['zones'][zone][ip]['disks'][builder] = \
                             newdevs
             if changed:
-                _ringsdef_helper(updated_cfg, 'nometadata', '/etc/swift')
-            return changed
+                _ringsdef_helper(updated_cfg, self.metadata, self.outdir)
+            return changed, updated_cfg
         except Exception as e:
             print "Error updating cluster configuration", e
             sys.exit(-1)
@@ -124,16 +151,18 @@ class CapacityManager(object):
         try:
             self.cluster_config = yaml.load(open(self.def_file, 'r'))
             expected_config = get_devices(self.cluster_config['zones'])
-            current_config = _get_all_cluster_devices()
+            current_config = self._get_all_cluster_devices()
             # To get devices to be removed we look for devices present in
             # current_config and not in expected_config
             # To get list of devices to be added look for devices in expected
             # not in current
-            additions = self._get_devices_changed(expected_config,
-                                                  current_config)
-            removals = self._get_devices_changed(current_config,
-                                                 expected_config)
-            # Reconcile the two structures in to single
+            if self.scaleup:
+                changes = self._get_devices_changed(expected_config,
+                                                      current_config)
+            else:
+                changes = self._get_devices_changed(current_config,
+                                                     expected_config)
+            self._normalize_changes(changes)
             # Each ring will be list of devices to be modified
             # Each device (in ring) will have following attributes:
             # - zone
@@ -142,13 +171,11 @@ class CapacityManager(object):
             # - target (device weight when adding, 0 when removing)
             # - step (amount to change every time till target reached)
             # step is defaulted to 10% or -10% of target
-            self._calculate_changes(additions, True)
-            self._calculate_changes(removals, False)
         except Exception as e:
             print "Error getting device info", e
             sys.exit(-1)
 
-    def _calculate_changes(self, source, add_operation=True):
+    def _normalize_changes(self, source):
         for builder in RING_TYPES:
             for zone, devadd in source[builder].items():
                 self.cluster_changes.setdefault(builder, [])
@@ -157,14 +184,16 @@ class CapacityManager(object):
                     dev = {}
                     dev['ip'] = device['ip']
                     dev['device'] = device['device']
-                    if add_operation:
+                    if 'delta' in device:
+                        step = int(math.ceil(device['delta']/self.iterations))
+                    else:
+                        step = int(math.ceil(device['weight']/self.iterations))
+                    if self.scaleup:
                         dev['target'] = device['weight']
-                        dev['step'] = int(math.ceil(device['weight'] /
-                                                    self.iterations))
+                        dev['step'] = step
                     else:
                         dev['target'] = 0
-                        dev['step'] = int(-1 * math.ceil(device['weight'] /
-                                                         self.iterations))
+                        dev['step'] = int(-1 * step)
                     devices.append(dev)
                 self.cluster_changes[builder].append({zone: devices})
 
@@ -176,48 +205,61 @@ class CapacityManager(object):
             for zone, devs in devices1[builder].iteritems():
                 if zone not in devices2[builder]:
                     devices[builder].setdefault(zone, []).extend(devs)
+                else:
+                    for dev in devs:
+                        found = False
+                        addDev = True
+                        for dev2 in devices2[builder][zone]:  
+                            if found:
+                                continue
+                            if dev2['ip'] == dev['ip'] and \
+                               dev2['device'] == dev['device']:
+                                   found = True
+                                   dev['delta'] = abs(int(dev2['weight']) - int(dev['weight']))
+                                   if dev['delta'] == 0:
+                                       # Found exact match device don't add
+                                       addDev = False
+                        if addDev:
+                            devices[builder].setdefault(zone, []).append(dev)
         return devices
 
-    def _setup_rsyslog(self):
-        self.logger = logging.getLogger('capman')
+    def _setup_logger(self):
+        self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
-        handler = SysLogHandler(address='/dev/log',
-                                facility=SysLogHandler.LOG_LOCAL0)
+        handler = logging.FileHandler(os.path.join(self.outdir, LOGFILE_NAME))
         fmt = logging.Formatter("%(name)s: %(levelname)s [-] %(message)s")
         handler.setFormatter(fmt)
         self.logger.addHandler(handler)
 
 
-def _get_ring_devices(ring_type, zone):
-    builder = RingBuilder.load(_get_builder_path(ring_type))
-    search_values = {}
-    search_values['zone'] = int(zone[1:])
-    devs = builder.search_devs(search_values)
-    list = {}
-    for dev in devs:
-        list[dev['device']] = dev['weight']
-    return list
-
-
-def _get_builder_path(ring_type):
-    return os.path.join('/etc/swift', ring_type + '.builder')
-
-
-def _get_all_cluster_devices():
-    devices = {}
-    for builder in RING_TYPES:
-        ring_builder = RingBuilder.load(_get_builder_path(builder))
-        devices[builder] = {}
-        for dev in ring_builder.devs:
-            if dev is None:
-                continue
-            device = {}
-            device['ip'] = dev['ip']
-            device['weight'] = dev['weight']
-            device['device'] = dev['device']
-            devices[builder].setdefault('z' + str(dev['zone']),
-                                        []).append(device)
-    return devices
+    def _get_ring_devices(self, ring_type, zone):
+        builder = self._get_builder(ring_type)
+        search_values = {}
+        search_values['zone'] = int(zone[1:])
+        devs = builder.search_devs(search_values)
+        list = {}
+        for dev in devs:
+            list[dev['device']] = dev['weight']
+        return list
+    
+    def _get_builder(self, ring_type):
+        return RingBuilder.load(os.path.join(self.outdir, ring_type + '.builder'))
+    
+    def _get_all_cluster_devices(self):
+        devices = {}
+        for builder in RING_TYPES:
+            ring_builder = self._get_builder(builder)
+            devices[builder] = {}
+            for dev in ring_builder.devs:
+                if dev is None:
+                    continue
+                device = {}
+                device['ip'] = dev['ip']
+                device['weight'] = dev['weight']
+                device['device'] = dev['device']
+                devices[builder].setdefault('z' + str(dev['zone']),
+                                            []).append(device)
+        return devices
 
 
 class SwiftRingsDefinition(object):
@@ -479,12 +521,21 @@ def _ringsdef_helper(config, metadata, outputdir):
     return ringsdef.nodes
 
 
-def manage(args):
+def scaleup(args):
+    rc = _manage(args.config, args.iterations, args.meta, args.outdir)
+
+
+def scaledown(args):
+    rc = _manage(args.config, args.iterations, args.meta, args.outdir, False)
+
+
+def _manage(configuration, iterations, metadata, outdir, scaleup=True):
     rc = 0
-    if not os.path.exists(args.config):
-        raise Exception("Could not find confguration file '%s'" % args.config)
+    if not os.path.exists(configuration):
+        raise Exception("Could not find confguration file '%s'" % configuration)
     try:
-        capman = CapacityManager(args.iterations, args.config)
+        capman = CapacityManager(iterations, configuration, scaleup, metadata,
+                                 outdir)
         capman.update_cluster()
     except Exception as e:
         print >> sys.stderr, "There was an error updating rings: '%s'" % e
@@ -512,16 +563,20 @@ def main():
 
     parser.add_argument('-i', dest='keyfile')
     parser.add_argument('-u', dest='user')
-    parser.add_argument('--config', required=True)
-    parser.add_argument('--outdir', required=True)
+    parser.add_argument('--config', default='/etc/swift/ring_definition.yml')
+    parser.add_argument('--outdir', default='/etc/swift')
+    parser.add_argument('--meta', default=None)
 
     parser_genconfig = subparsers.add_parser('bootstrap')
-    parser_genconfig.add_argument('--meta', default=None)
     parser_genconfig.set_defaults(func=bootstrap)
 
-    parser_manage = subparsers.add_parser('manage')
+    parser_manage = subparsers.add_parser('scaleup')
     parser_manage.add_argument('--iterations', default=10)
-    parser_manage.set_defaults(func=manage)
+    parser_manage.set_defaults(func=scaleup)
+   
+    parser_manage = subparsers.add_parser('scaledown')
+    parser_manage.add_argument('--iterations', default=10)
+    parser_manage.set_defaults(func=scaledown)
 
     args = parser.parse_args()
     if args.keyfile:

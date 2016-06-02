@@ -227,10 +227,10 @@ class CapacityManager(object):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         handler = logging.FileHandler(os.path.join(self.outdir, LOGFILE_NAME))
-        fmt = logging.Formatter("%(name)s: %(levelname)s [-] %(message)s")
+        fmt = logging.Formatter(fmt='%(asctime)s %(name)s %(levelname)s:'
+                                ' %(message)s', datefmt='%F %H:%M:%S')
         handler.setFormatter(fmt)
         self.logger.addHandler(handler)
-
 
     def _get_ring_devices(self, ring_type, zone):
         builder = self._get_builder(ring_type)
@@ -531,6 +531,8 @@ def scaledown(args):
 
 def _manage(configuration, iterations, metadata, outdir, scaleup=True):
     rc = 0
+    if os.path.exists(os.path.join(outdir, STATUS_FILE)):
+        raise Exception("Scale up/down operation is currently in progress")
     if not os.path.exists(configuration):
         raise Exception("Could not find confguration file '%s'" % configuration)
     try:

@@ -1,0 +1,4 @@
+Fabric
+PyYAML
+gitpython
+netifaces

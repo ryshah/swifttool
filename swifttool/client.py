@@ -20,6 +20,7 @@
 
 import argparse
 import glob
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,19 @@ from netifaces import interfaces, ifaddresses, AF_INET
 RING_TYPES = ['account', 'container', 'object']
 
 _host_lshw_output = {}
+
+LOG = logging.getLogger(__name__)
+
+
+def _setup_logger(level=logging.INFO):
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    log_handler = logging.StreamHandler(sys.stdout)
+    fmt = logging.Formatter(fmt='%(asctime)s %(threadName)s %(name)s '
+                            '%(levelname)s: %(message)s',
+                            datefmt='%F %H:%M:%S')
+    log_handler.setFormatter(fmt)
+    logger.addHandler(log_handler)
 
 
 def _parse_lshw_output(output, blockdev):
@@ -294,7 +308,7 @@ def bootstrap(args):
                 hosts=ringsdef.nodes)
         execute(_fab_start_swift_services, hosts=ringsdef.nodes)
     except Exception as e:
-        print >> sys.stderr, "There was an error bootrapping: '%s'" % e
+        LOG.error("There was an error bootrapping: '%s'", e)
         rc = -1
 
     sys.exit(rc)
@@ -302,6 +316,8 @@ def bootstrap(args):
 
 def main():
     parser = argparse.ArgumentParser(description='Tool to modify swift config')
+    parser.add_argument('-d', '--debug', action='store_true')
+
     subparsers = parser.add_subparsers()
 
     parser.add_argument('-i', dest='keyfile')
@@ -314,6 +330,12 @@ def main():
     parser_genconfig.set_defaults(func=bootstrap)
 
     args = parser.parse_args()
+
+    level = logging.INFO
+    if args.debug:
+        level = logging.DEBUG
+    _setup_logger(level)
+
     if args.keyfile:
         env.key_filename = args.keyfile
     if args.user:

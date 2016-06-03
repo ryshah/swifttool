@@ -20,8 +20,6 @@
 
 import argparse
 import glob
-import json
-import netifaces
 import os
 import re
 import shutil
@@ -31,7 +29,7 @@ import sys
 import tempfile
 import yaml
 
-from fabric.api import env, execute, hide, parallel, put, run, settings, sudo
+from fabric.api import env, execute, hide, parallel, put, sudo
 from netifaces import interfaces, ifaddresses, AF_INET
 
 RING_TYPES = ['account', 'container', 'object']

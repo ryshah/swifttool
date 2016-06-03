@@ -1,6 +1,22 @@
 swifttool
 =========
-a tool to help us properly boostrap and manage a swift environment.
+a tool to help us properly boostrap and manage a [swift](https://github.com/openstack/swift) environment.
+
+installation
+------------
+```
+$ pip install -r requirements.txt
+$ python setup.py install
+```
+
+testing
+-------
+```
+$ tox
+```
+
+ring definition file
+--------------------
 
 Sample ring_definition.yml to use SSD for account/container rings and SATA for object ring:
 
@@ -47,5 +63,5 @@ zones:
 ```
 
 license
-=======
+-------
 this is released under the Apache license
